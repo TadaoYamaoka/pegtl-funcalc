@@ -56,6 +56,11 @@ public:
                 if (rval == 0)
                     throw std::runtime_error("ゼロ除算エラー");
                 return lval / rval;
+            case '^': return std::pow(lval, rval);
+            case '%':
+                if (rval == 0)
+                    throw std::runtime_error("ゼロでの剰余演算エラー");
+                return std::fmod(lval, rval);
             default:
                 throw std::runtime_error("無効な演算子");
         }
@@ -76,7 +81,7 @@ public:
     }
 };
 
-// 関数呼び出しノード
+// 単一引数関数ノード
 class FunctionNode : public ASTNode {
     std::string name_;
     std::unique_ptr<ASTNode> arg_;
@@ -94,6 +99,48 @@ public:
         if (name_ == "log") return std::log(arg_val);
         if (name_ == "exp") return std::exp(arg_val);
         if (name_ == "abs") return std::abs(arg_val);
+
+        throw std::runtime_error("未定義の関数: " + name_);
+    }
+};
+
+// 複数引数関数ノード
+class MultiArgFunctionNode : public ASTNode {
+    std::string name_;
+    std::vector<std::unique_ptr<ASTNode>> args_;
+public:
+    MultiArgFunctionNode(const std::string& name, std::vector<std::unique_ptr<ASTNode>>&& args)
+        : name_(name), args_(std::move(args)) {}
+
+    double eval(std::map<std::string, double>& vars) const override {
+        std::vector<double> arg_vals;
+        for (const auto& arg : args_) {
+            arg_vals.push_back(arg->eval(vars));
+        }
+
+        if (name_ == "pow") {
+            if (arg_vals.size() != 2)
+                throw std::runtime_error("pow関数は2つの引数が必要です");
+            return std::pow(arg_vals[0], arg_vals[1]);
+        }
+        if (name_ == "max") {
+            if (arg_vals.empty())
+                throw std::runtime_error("max関数には少なくとも1つの引数が必要です");
+            double max_val = arg_vals[0];
+            for (size_t i = 1; i < arg_vals.size(); ++i) {
+                if (arg_vals[i] > max_val) max_val = arg_vals[i];
+            }
+            return max_val;
+        }
+        if (name_ == "min") {
+            if (arg_vals.empty())
+                throw std::runtime_error("min関数には少なくとも1つの引数が必要です");
+            double min_val = arg_vals[0];
+            for (size_t i = 1; i < arg_vals.size(); ++i) {
+                if (arg_vals[i] < min_val) min_val = arg_vals[i];
+            }
+            return min_val;
+        }
 
         throw std::runtime_error("未定義の関数: " + name_);
     }
@@ -117,10 +164,12 @@ public:
 // パーサーの状態
 struct ParserState {
     std::vector<std::unique_ptr<ASTNode>> values;  // 値のスタック
-    bool in_function_call = false;                 // 関数呼び出し処理中フラグ
-    std::vector<std::string> function_names;       // 関数名をスタックとして管理
+    std::vector<std::string> function_names;       // 関数名のスタック
     std::vector<char> ops;                         // 演算子のスタック
-    char temp_unary_op = 0;                        // 単項演算子の一時保管用
+    char temp_unary_op = 0;                        // 単項演算子の一時保管
+
+    // 複数引数関数用のスタック
+    std::vector<std::vector<std::unique_ptr<ASTNode>>> arg_lists;
 
     // 演算子を追加
     void push_operator(char op) {
@@ -142,6 +191,33 @@ struct ParserState {
             throw std::runtime_error("構文エラー: 式が正しく構築されていません");
         return std::move(values.back());
     }
+
+    // 現在の引数リストに引数を追加
+    void add_argument() {
+        if (arg_lists.empty()) {
+            arg_lists.push_back({});
+        }
+        if (values.empty()) {
+            throw std::runtime_error("関数引数の構文エラー");
+        }
+        arg_lists.back().push_back(std::move(values.back()));
+        values.pop_back();
+    }
+
+    // 新しい引数リストを開始
+    void start_arg_list() {
+        arg_lists.push_back({});
+    }
+
+    // 引数リストを取得して削除
+    std::vector<std::unique_ptr<ASTNode>> get_arg_list() {
+        if (arg_lists.empty()) {
+            return {};
+        }
+        auto result = std::move(arg_lists.back());
+        arg_lists.pop_back();
+        return result;
+    }
 };
 
 // 文法定義
@@ -150,14 +226,26 @@ namespace calculator {
 
     // 前方宣言
     struct expr;
-    struct unary;
+    struct addition;
 
     // 基本ルール
     struct ws : one<' ', '\t'> {};
     struct spaces : star<ws> {};
 
     struct integer : plus<digit> {};
-    struct decimal : seq<opt<one<'+', '-'>>, integer, opt<seq<one<'.'>, star<digit>>>> {};
+
+    // 科学的表記法を含む小数点数
+    struct decimal : seq<
+        opt<one<'+', '-'>>,
+        integer,
+        opt<seq<one<'.'>, star<digit>>>,
+        opt<seq<
+            one<'e', 'E'>,
+            opt<one<'+', '-'>>,
+            integer
+        >>
+    > {};
+
     struct number : decimal {};
 
     // 識別子（基本ルール）
@@ -169,10 +257,11 @@ namespace calculator {
     // 代入左辺用（区別のため）
     struct assign_id : identifier {};
 
-    // 関数呼び出し
-    struct func_name : identifier {};
-    struct func_args : if_must<one<'('>, spaces, expr, spaces, one<')'>> {};
-    struct function_call : seq<func_name, spaces, func_args> {};
+    // 関数呼び出しと引数リスト関連の前方宣言
+    struct func_name;
+    struct func_args;
+    struct func_arg_list;
+    struct function_call;
 
     // 括弧式
     struct parenthesized : if_must<one<'('>, spaces, expr, spaces, one<')'>> {};
@@ -182,13 +271,18 @@ namespace calculator {
 
     // 単項演算子および単項式
     struct unary_operator : one<'-', '+'> {};
-    struct prefixed_unary : seq<unary_operator, spaces, unary> {};
+    struct prefixed_unary : seq<unary_operator, spaces, sor<primary, prefixed_unary>> {};
     struct unary : sor<prefixed_unary, primary> {};
 
-    // 乗除算
-    struct mul_operator : one<'*', '/'> {};
-    struct mul_op : seq<spaces, mul_operator, spaces, unary> {};
-    struct multiplication : seq<unary, star<mul_op>> {};
+    // べき乗演算
+    struct power_operator : one<'^'> {};
+    struct power_op : seq<spaces, power_operator, spaces, unary> {};
+    struct power : seq<unary, star<power_op>> {};
+
+    // 乗除算と剰余
+    struct mul_operator : one<'*', '/', '%'> {}; 
+    struct mul_op : seq<spaces, mul_operator, spaces, power> {};
+    struct multiplication : seq<power, star<mul_op>> {};
 
     // 加減算
     struct add_operator : one<'+', '-'> {};
@@ -200,6 +294,22 @@ namespace calculator {
 
     // 式
     struct expr : sor<assignment, addition> {};
+
+    // 関数引数は式と同じ規則
+    struct func_arg : expr {};
+
+    // カンマで区切られた引数リスト
+    struct arg_sep : seq<spaces, one<','>, spaces> {};
+    struct func_arg_tail : seq<arg_sep, func_arg> {};
+    struct func_arg_list : seq<func_arg, star<func_arg_tail>> {};
+
+    // 関数呼び出し
+    struct func_args : if_must<one<'('>, spaces, opt<func_arg_list>, spaces, one<')'>> {};
+    // 関数呼び出しとして認識する前に、識別子の後に必ず '(' が続くことを確認
+    struct function_call : if_must<at<seq<identifier, spaces, one<'('>>>, seq<func_name, spaces, func_args>> {};
+
+    // 関数名
+    struct func_name : identifier {};
 
     // 文法全体
     struct grammar : must<spaces, expr, spaces, eof> {};
@@ -226,52 +336,62 @@ namespace calculator {
         }
     };
 
-    // 代入左辺用 assign_id：何も行わない
-    template<>
-    struct action<assign_id> {
-        template<typename ActionInput>
-        static void apply(const ActionInput& /*in*/, ParserState& state) {
-            // assignment のアクションで入力全体から左辺を抽出するため、ここでは何もしない
-        }
-    };
-
     // 関数呼び出し：関数名をスタックにプッシュ
     template<>
     struct action<func_name> {
         template<typename ActionInput>
         static void apply(const ActionInput& in, ParserState& state) {
             state.function_names.push_back(in.string());
-            state.in_function_call = true;
+            state.start_arg_list();  // 新しい引数リストを開始
         }
     };
 
-    // 関数呼び出し引数：終了処理
+    // 最初の引数の処理（入れ子でも arg_lists が空でなければ処理）
+    template<>
+    struct action<func_arg> {
+        template<typename ActionInput>
+        static void apply(const ActionInput& /*in*/, ParserState& state) {
+            if (!state.arg_lists.empty() && !state.values.empty()) {
+                state.add_argument();
+            }
+        }
+    };
+
+    // 追加の引数の処理
+    template<>
+    struct action<func_arg_tail> {
+        template<typename ActionInput>
+        static void apply(const ActionInput& /*in*/, ParserState& state) {
+            // 既に最初の引数は func_arg で処理済み
+        }
+    };
+
+    // 関数引数リスト終了処理（空のアクション）
     template<>
     struct action<func_args> {
         template<typename ActionInput>
-        static void apply(const ActionInput& /*in*/, ParserState& state) {
-            state.in_function_call = false;
+        static void apply(const ActionInput& /*in*/, ParserState& /*state*/) {
         }
     };
 
-    // 関数呼び出し全体：FunctionNode を生成
+    // 関数呼び出し全体：FunctionNode または MultiArgFunctionNode を生成
     template<>
     struct action<function_call> {
         template<typename ActionInput>
         static void apply(const ActionInput& /*in*/, ParserState& state) {
-            if (state.values.empty())
-                throw std::runtime_error("関数呼び出しの構文が不正です");
             if (state.function_names.empty())
                 throw std::runtime_error("関数名スタックが空です");
 
-            auto arg = std::move(state.values.back());
-            state.values.pop_back();
-
-            // スタックから関数名を取得して削除
             std::string func_name = state.function_names.back();
             state.function_names.pop_back();
 
-            state.values.push_back(std::make_unique<FunctionNode>(func_name, std::move(arg)));
+            auto args = state.get_arg_list();
+
+            if (args.size() == 1) {
+                state.values.push_back(std::make_unique<FunctionNode>(func_name, std::move(args[0])));
+            } else {
+                state.values.push_back(std::make_unique<MultiArgFunctionNode>(func_name, std::move(args)));
+            }
         }
     };
 
@@ -297,6 +417,30 @@ namespace calculator {
         }
     };
 
+    // べき乗演算子
+    template<>
+    struct action<power_operator> {
+        template<typename ActionInput>
+        static void apply(const ActionInput& in, ParserState& state) {
+            state.push_operator(in.string()[0]);
+        }
+    };
+
+    // べき乗演算
+    template<>
+    struct action<power_op> {
+        template<typename ActionInput>
+        static void apply(const ActionInput& /*in*/, ParserState& state) {
+            if (state.values.size() < 2)
+                throw std::runtime_error("べき乗演算子の構文エラー");
+            auto right = std::move(state.values.back());
+            state.values.pop_back();
+            auto left = std::move(state.values.back());
+            state.values.pop_back();
+            state.values.push_back(std::make_unique<BinaryOpNode>(state.pop_operator(), std::move(left), std::move(right)));
+        }
+    };
+
     // 加減算：演算子を記録
     template<>
     struct action<add_operator> {
@@ -306,7 +450,7 @@ namespace calculator {
         }
     };
 
-    // 加減算：左結合で AST を構築（BinaryOpNode の生成）
+    // 加減算：左結合で AST を構築
     template<>
     struct action<add_op> {
         template<typename ActionInput>
@@ -330,7 +474,7 @@ namespace calculator {
         }
     };
 
-    // 乗除算：左結合で AST を構築（BinaryOpNode の生成）
+    // 乗除算：左結合で AST を構築
     template<>
     struct action<mul_op> {
         template<typename ActionInput>
@@ -362,6 +506,14 @@ namespace calculator {
             var_name.erase(0, var_name.find_first_not_of(" \t"));
             var_name.erase(var_name.find_last_not_of(" \t") + 1);
             state.values.push_back(std::make_unique<AssignmentNode>(var_name, std::move(right)));
+        }
+    };
+
+    // 代入左辺用 assign_id：何も行わない
+    template<>
+    struct action<assign_id> {
+        template<typename ActionInput>
+        static void apply(const ActionInput& /*in*/, ParserState& state) {
         }
     };
 }
