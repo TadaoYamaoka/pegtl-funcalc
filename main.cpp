@@ -1,6 +1,7 @@
 #include <iostream>
 #include <map>
 #include <cmath>
+#include <numbers>
 #include <string>
 #include <memory>
 #include <vector>
@@ -520,6 +521,10 @@ namespace calculator {
 
 int main() {
     std::map<std::string, double> variables;
+
+    // 定数の事前定義
+    variables["pi"] = std::numbers::pi;
+    variables["e"]  = std::numbers::e;
 
     std::cout << "C++20関数電卓 (exitで終了)" << std::endl;
 
