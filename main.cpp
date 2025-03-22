@@ -118,7 +118,7 @@ public:
 struct ParserState {
     std::vector<std::unique_ptr<ASTNode>> values;  // 値のスタック
     bool in_function_call = false;                 // 関数呼び出し処理中フラグ
-    std::string current_function_name;             // 現在処理中の関数名
+    std::vector<std::string> function_names;       // 関数名をスタックとして管理
     std::vector<char> ops;                         // 演算子のスタック
     char temp_unary_op = 0;                        // 単項演算子の一時保管用
 
@@ -235,12 +235,12 @@ namespace calculator {
         }
     };
 
-    // 関数呼び出し：関数名を記録
+    // 関数呼び出し：関数名をスタックにプッシュ
     template<>
     struct action<func_name> {
         template<typename ActionInput>
         static void apply(const ActionInput& in, ParserState& state) {
-            state.current_function_name = in.string();
+            state.function_names.push_back(in.string());
             state.in_function_call = true;
         }
     };
@@ -261,9 +261,17 @@ namespace calculator {
         static void apply(const ActionInput& /*in*/, ParserState& state) {
             if (state.values.empty())
                 throw std::runtime_error("関数呼び出しの構文が不正です");
+            if (state.function_names.empty())
+                throw std::runtime_error("関数名スタックが空です");
+
             auto arg = std::move(state.values.back());
             state.values.pop_back();
-            state.values.push_back(std::make_unique<FunctionNode>(state.current_function_name, std::move(arg)));
+
+            // スタックから関数名を取得して削除
+            std::string func_name = state.function_names.back();
+            state.function_names.pop_back();
+
+            state.values.push_back(std::make_unique<FunctionNode>(func_name, std::move(arg)));
         }
     };
 
