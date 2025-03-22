@@ -8,8 +8,58 @@
 #include <functional>
 #include <algorithm>
 #include <tao/pegtl.hpp>
+#include <boost/rational.hpp>
 
 namespace pegtl = tao::pegtl;
+
+// 有理数型の定義
+using Rational = boost::rational<int64_t>;
+
+// 文字列から有理数への変換ヘルパー関数
+Rational stringToRational(const std::string& str) {
+    // 科学的表記法を扱う場合は一時的にdoubleへ変換
+    if (str.find('e') != std::string::npos || str.find('E') != std::string::npos) {
+        double d = std::stod(str);
+        // 十分な精度で有理数に近似
+        const int64_t precision = 1000000000;
+        return Rational(static_cast<int64_t>(d * precision), precision);
+    }
+
+    // 小数点を含む場合は分子と分母を計算
+    size_t dot_pos = str.find('.');
+    if (dot_pos != std::string::npos) {
+        std::string int_part = str.substr(0, dot_pos);
+        std::string frac_part = str.substr(dot_pos + 1);
+
+        // 符号の処理
+        bool negative = false;
+        if (!int_part.empty() && int_part[0] == '-') {
+            negative = true;
+            int_part = int_part.substr(1);
+        }
+
+        // 分子 = 整数部 * 10^(小数部の桁数) + 小数部
+        int64_t numerator = 0;
+        if (!int_part.empty()) {
+            numerator = std::stoll(int_part);
+        }
+        numerator = numerator * static_cast<int64_t>(std::pow(10, frac_part.length())) + 
+                   (frac_part.empty() ? 0 : std::stoll(frac_part));
+
+        // 分母 = 10^(小数部の桁数)
+        int64_t denominator = static_cast<int64_t>(std::pow(10, frac_part.length()));
+
+        // 符号を適用
+        if (negative) {
+            numerator = -numerator;
+        }
+
+        return Rational(numerator, denominator);
+    } else {
+        // 整数の場合
+        return Rational(std::stoll(str));
+    }
+}
 
 // ユーザー定義関数を保持するためのグローバル定義
 struct UserFunction {
@@ -22,16 +72,16 @@ std::map<std::string, UserFunction> userFunctions;
 // 抽象構文木（AST）のノード定義
 class ASTNode {
 public:
-    virtual double eval(std::map<std::string, double>& vars) = 0;
+    virtual Rational eval(std::map<std::string, Rational>& vars) = 0;
     virtual ~ASTNode() = default;
 };
 
 // 数値ノード
 class NumberNode : public ASTNode {
-    double value_;
+    Rational value_;
 public:
-    NumberNode(double value) : value_(value) {}
-    double eval(std::map<std::string, double>& /*vars*/) override { return value_; }
+    NumberNode(const std::string& value) : value_(stringToRational(value)) {}
+    Rational eval(std::map<std::string, Rational>& /*vars*/) override { return value_; }
 };
 
 // 変数参照ノード
@@ -39,7 +89,7 @@ class VariableNode : public ASTNode {
     std::string name_;
 public:
     VariableNode(const std::string& name) : name_(name) {}
-    double eval(std::map<std::string, double>& vars) override {
+    Rational eval(std::map<std::string, Rational>& vars) override {
         if (vars.find(name_) == vars.end())
             throw std::runtime_error("未定義の変数: " + name_);
         return vars[name_];
@@ -54,23 +104,50 @@ public:
     BinaryOpNode(char op, std::unique_ptr<ASTNode> left, std::unique_ptr<ASTNode> right)
         : op_(op), left_(std::move(left)), right_(std::move(right)) {}
 
-    double eval(std::map<std::string, double>& vars) override {
-        double lval = left_->eval(vars);
-        double rval = right_->eval(vars);
+    Rational eval(std::map<std::string, Rational>& vars) override {
+        Rational lval = left_->eval(vars);
+        Rational rval = right_->eval(vars);
 
         switch (op_) {
             case '+': return lval + rval;
             case '-': return lval - rval;
             case '*': return lval * rval;
             case '/':
-                if (rval == 0)
+                if (rval.numerator() == 0)
                     throw std::runtime_error("ゼロ除算エラー");
                 return lval / rval;
-            case '^': return std::pow(lval, rval);
+            case '^': {
+                // べき乗は整数の場合のみ正確に計算、それ以外は近似
+                if (rval.denominator() == 1) {
+                    // 整数のべき乗
+                    int64_t exp = rval.numerator();
+                    bool neg_exp = exp < 0;
+                    exp = std::abs(exp);
+
+                    Rational result(1);
+                    for (int64_t i = 0; i < exp; ++i) {
+                        result *= lval;
+                    }
+
+                    if (neg_exp) {
+                        return Rational(1) / result;
+                    }
+                    return result;
+                } else {
+                    // 浮動小数点数に変換して計算し、有理数に戻す
+                    double lval_d = boost::rational_cast<double>(lval);
+                    double rval_d = boost::rational_cast<double>(rval);
+                    double result_d = std::pow(lval_d, rval_d);
+                    const int64_t precision = 1000000000;
+                    return Rational(static_cast<int64_t>(result_d * precision), precision);
+                }
+            }
             case '%':
-                if (rval == 0)
+                if (rval.numerator() == 0)
                     throw std::runtime_error("ゼロでの剰余演算エラー");
-                return std::fmod(lval, rval);
+                // 有理数の剰余演算
+                return Rational(lval.numerator() * rval.denominator() % (rval.numerator() * lval.denominator()),
+                               lval.denominator() * rval.denominator());
             default:
                 throw std::runtime_error("無効な演算子");
         }
@@ -84,8 +161,8 @@ class UnaryOpNode : public ASTNode {
 public:
     UnaryOpNode(char op, std::unique_ptr<ASTNode> operand)
         : op_(op), operand_(std::move(operand)) {}
-    double eval(std::map<std::string, double>& vars) override {
-        double val = operand_->eval(vars);
+    Rational eval(std::map<std::string, Rational>& vars) override {
+        Rational val = operand_->eval(vars);
         if (op_ == '-') return -val;
         if (op_ == '+') return val;
         throw std::runtime_error("無効な単項演算子");
@@ -100,63 +177,92 @@ public:
     FunctionNode(const std::string& name, std::unique_ptr<ASTNode> arg)
         : name_(name), arg_(std::move(arg)) {}
 
-    double eval(std::map<std::string, double>& vars) override {
-        double arg_val = arg_->eval(vars);
+    Rational eval(std::map<std::string, Rational>& vars) override {
+        Rational arg_val = arg_->eval(vars);
+        double arg_d = boost::rational_cast<double>(arg_val);
+        double result_d;
+        const int64_t precision = 1000000000;
 
         // 数学関数
-        if (name_ == "sqrt")  return std::sqrt(arg_val);
-        if (name_ == "log")   return std::log(arg_val);
-        if (name_ == "exp")   return std::exp(arg_val);
-        if (name_ == "abs")   return std::abs(arg_val);
-        if (name_ == "log2")  return std::log2(arg_val);
-        if (name_ == "log10") return std::log10(arg_val);
-        if (name_ == "cbrt")  return std::cbrt(arg_val);
-        if (name_ == "exp2")  return std::exp2(arg_val);
-        if (name_ == "expm1") return std::expm1(arg_val);
-        if (name_ == "log1p") return std::log1p(arg_val);
-        if (name_ == "erf")   return std::erf(arg_val);
-        if (name_ == "erfc")  return std::erfc(arg_val);
-
-        // 三角関数
-        if (name_ == "sin")   return std::sin(arg_val);
-        if (name_ == "cos")   return std::cos(arg_val);
-        if (name_ == "tan")   return std::tan(arg_val);
-
-        // 逆三角関数
-        if (name_ == "asin")  return std::asin(arg_val);
-        if (name_ == "acos")  return std::acos(arg_val);
-        if (name_ == "atan")  return std::atan(arg_val);
-    
-        // 双曲線関数
-        if (name_ == "sinh")  return std::sinh(arg_val);
-        if (name_ == "cosh")  return std::cosh(arg_val);
-        if (name_ == "tanh")  return std::tanh(arg_val);
-    
-        // 逆双曲線関数
-        if (name_ == "asinh") return std::asinh(arg_val);
-        if (name_ == "acosh") return std::acosh(arg_val);
-        if (name_ == "atanh") return std::atanh(arg_val);
-
-        // 丸め関数
-        if (name_ == "ceil")  return std::ceil(arg_val);
-        if (name_ == "floor") return std::floor(arg_val);
-        if (name_ == "round") return std::round(arg_val);
-        if (name_ == "trunc") return std::trunc(arg_val);
-
-        // ユーザー定義関数（1引数）
-        auto it = userFunctions.find(name_);
-        if (it != userFunctions.end()) {
-            if (it->second.parameters.size() != 1)
-                throw std::runtime_error("関数 " + name_ + " は1引数関数ではありません");
-            std::map<std::string, double> local_vars = vars;
-            local_vars[it->second.parameters[0]] = arg_val;
-            return it->second.body->eval(local_vars);
+        if (name_ == "sqrt")  result_d = std::sqrt(arg_d);
+        else if (name_ == "log")   result_d = std::log(arg_d);
+        else if (name_ == "exp")   result_d = std::exp(arg_d);
+        else if (name_ == "abs")   {
+            // absは有理数でそのまま計算可能
+            return Rational(std::abs(arg_val.numerator()), std::abs(arg_val.denominator()));
         }
-        throw std::runtime_error("未定義の関数: " + name_);
+        else if (name_ == "log2")  result_d = std::log2(arg_d);
+        else if (name_ == "log10") result_d = std::log10(arg_d);
+        else if (name_ == "cbrt")  result_d = std::cbrt(arg_d);
+        else if (name_ == "exp2")  result_d = std::exp2(arg_d);
+        else if (name_ == "expm1") result_d = std::expm1(arg_d);
+        else if (name_ == "log1p") result_d = std::log1p(arg_d);
+        else if (name_ == "erf")   result_d = std::erf(arg_d);
+        else if (name_ == "erfc")  result_d = std::erfc(arg_d);
+        // 三角関数
+        else if (name_ == "sin")   result_d = std::sin(arg_d);
+        else if (name_ == "cos")   result_d = std::cos(arg_d);
+        else if (name_ == "tan")   result_d = std::tan(arg_d);
+        // 逆三角関数
+        else if (name_ == "asin")  result_d = std::asin(arg_d);
+        else if (name_ == "acos")  result_d = std::acos(arg_d);
+        else if (name_ == "atan")  result_d = std::atan(arg_d);
+        // 双曲線関数
+        else if (name_ == "sinh")  result_d = std::sinh(arg_d);
+        else if (name_ == "cosh")  result_d = std::cosh(arg_d);
+        else if (name_ == "tanh")  result_d = std::tanh(arg_d);
+        // 逆双曲線関数
+        else if (name_ == "asinh") result_d = std::asinh(arg_d);
+        else if (name_ == "acosh") result_d = std::acosh(arg_d);
+        else if (name_ == "atanh") result_d = std::atanh(arg_d);
+        // 丸め関数
+        else if (name_ == "ceil")  {
+            // 有理数のceil演算
+            int64_t num = arg_val.numerator();
+            int64_t den = arg_val.denominator();
+            if (num % den == 0) return Rational(num / den);
+            return Rational(num / den + (num > 0 ? 1 : 0));
+        }
+        else if (name_ == "floor") {
+            // 有理数のfloor演算
+            int64_t num = arg_val.numerator();
+            int64_t den = arg_val.denominator();
+            if (num % den == 0) return Rational(num / den);
+            return Rational(num / den - (num < 0 ? 1 : 0));
+        }
+        else if (name_ == "round") {
+            // 有理数のround演算
+            int64_t num = arg_val.numerator();
+            int64_t den = arg_val.denominator();
+            int64_t quot = num / den;
+            int64_t rem = std::abs(num % den);
+            if (2 * rem >= den)
+                return Rational(quot + (num >= 0 ? 1 : -1));
+            return Rational(quot);
+        }
+        else if (name_ == "trunc") {
+            // 有理数のtrunc演算
+            return Rational(arg_val.numerator() / arg_val.denominator());
+        }
+        // ユーザー定義関数（1引数）
+        else {
+            auto it = userFunctions.find(name_);
+            if (it != userFunctions.end()) {
+                if (it->second.parameters.size() != 1)
+                    throw std::runtime_error("関数 " + name_ + " は1引数関数ではありません");
+                std::map<std::string, Rational> local_vars = vars;
+                local_vars[it->second.parameters[0]] = arg_val;
+                return it->second.body->eval(local_vars);
+            }
+            throw std::runtime_error("未定義の関数: " + name_);
+        }
+
+        // 結果を有理数に近似変換
+        return Rational(static_cast<int64_t>(result_d * precision), precision);
     }
 };
 
-// 組み込み複数引数関数ノード（加えてユーザー定義関数をチェック）
+// 組み込み複数引数関数ノード
 class MultiArgFunctionNode : public ASTNode {
     std::string name_;
     std::vector<std::unique_ptr<ASTNode>> args_;
@@ -164,8 +270,8 @@ public:
     MultiArgFunctionNode(const std::string& name, std::vector<std::unique_ptr<ASTNode>>&& args)
         : name_(name), args_(std::move(args)) {}
 
-    double eval(std::map<std::string, double>& vars) override {
-        std::vector<double> arg_vals;
+    Rational eval(std::map<std::string, Rational>& vars) override {
+        std::vector<Rational> arg_vals;
         for (const auto& arg : args_) {
             arg_vals.push_back(arg->eval(vars));
         }
@@ -173,30 +279,56 @@ public:
         if (name_ == "pow") {
             if (arg_vals.size() != 2)
                 throw std::runtime_error("pow関数は2つの引数が必要です");
-            return std::pow(arg_vals[0], arg_vals[1]);
+
+            // pow関数は整数のべき乗のみ正確計算
+            if (arg_vals[1].denominator() == 1) {
+                int64_t exp = arg_vals[1].numerator();
+                bool neg_exp = exp < 0;
+                exp = std::abs(exp);
+
+                Rational result(1);
+                for (int64_t i = 0; i < exp; ++i) {
+                    result *= arg_vals[0];
+                }
+
+                if (neg_exp) {
+                    return Rational(1) / result;
+                }
+                return result;
+            } else {
+                // 浮動小数点数に変換して計算
+                double base = boost::rational_cast<double>(arg_vals[0]);
+                double exponent = boost::rational_cast<double>(arg_vals[1]);
+                double result = std::pow(base, exponent);
+                const int64_t precision = 1000000000;
+                return Rational(static_cast<int64_t>(result * precision), precision);
+            }
         }
+
         if (name_ == "max") {
             if (arg_vals.empty())
                 throw std::runtime_error("max関数には少なくとも1つの引数が必要です");
-            double max_val = arg_vals[0];
+            Rational max_val = arg_vals[0];
             for (size_t i = 1; i < arg_vals.size(); ++i)
                 if (arg_vals[i] > max_val) max_val = arg_vals[i];
             return max_val;
         }
+
         if (name_ == "min") {
             if (arg_vals.empty())
                 throw std::runtime_error("min関数には少なくとも1つの引数が必要です");
-            double min_val = arg_vals[0];
+            Rational min_val = arg_vals[0];
             for (size_t i = 1; i < arg_vals.size(); ++i)
                 if (arg_vals[i] < min_val) min_val = arg_vals[i];
             return min_val;
         }
+
         // ユーザー定義関数（複数引数）
         auto it = userFunctions.find(name_);
         if (it != userFunctions.end()) {
             if (it->second.parameters.size() != arg_vals.size())
                 throw std::runtime_error("関数 " + name_ + " の引数の数が一致しません");
-            std::map<std::string, double> local_vars = vars;
+            std::map<std::string, Rational> local_vars = vars;
             for (size_t i = 0; i < arg_vals.size(); ++i) {
                 local_vars[it->second.parameters[i]] = arg_vals[i];
             }
@@ -214,8 +346,8 @@ public:
     AssignmentNode(const std::string& name, std::unique_ptr<ASTNode> expr)
         : name_(name), expr_(std::move(expr)) {}
 
-    double eval(std::map<std::string, double>& vars) override {
-        double val = expr_->eval(vars);
+    Rational eval(std::map<std::string, Rational>& vars) override {
+        Rational val = expr_->eval(vars);
         vars[name_] = val;
         return val;
     }
@@ -230,11 +362,10 @@ public:
     FunctionDefinitionNode(const std::string& name, std::vector<std::string>&& params, std::unique_ptr<ASTNode> body)
         : name_(name), parameters_(std::move(params)), body_(std::move(body)) {}
 
-    double eval(std::map<std::string, double>& /*vars*/) override {
+    Rational eval(std::map<std::string, Rational>& /*vars*/) override {
         userFunctions[name_] = UserFunction{ parameters_, std::move(body_) };
         std::cout << "関数 " << name_ << " を定義しました。" << std::endl;
-        // 関数定義の場合は評価結果として何も出力しない
-        return 0.0;
+        return Rational(0);
     }
 };
 
@@ -375,10 +506,10 @@ namespace calculator {
     // 乗除算（明示的な演算子）用
     struct mul_operator : one<'*', '/', '%'> {};
     struct mul_op : seq<spaces, mul_operator, spaces, power> {};
-    
+
     // 暗黙の乗算ルール：直後が数字、識別子、または '(' で始まる場合に適用
     struct implicit_mul : seq<spaces, at<sor<digit, identifier, one<'('>>>, power> {};
-    
+
     // 明示的な乗算と暗黙の乗算のいずれかを複数繰り返し可能にする
     struct multiplication : seq<power, star<sor<mul_op, implicit_mul>>> {};
 
@@ -422,7 +553,7 @@ namespace calculator {
     struct action<number> {
         template<typename ActionInput>
         static void apply(const ActionInput& in, ParserState& state) {
-            state.values.push_back(std::make_unique<NumberNode>(std::stod(in.string())));
+            state.values.push_back(std::make_unique<NumberNode>(in.string()));
         }
     };
 
@@ -679,13 +810,14 @@ namespace calculator {
 }
 
 int main() {
-    std::map<std::string, double> variables;
+    std::map<std::string, Rational> variables;
 
     // 定数の事前定義
-    variables["pi"] = std::numbers::pi;
-    variables["e"]  = std::numbers::e;
+    const int64_t precision = 1000000000;
+    variables["pi"] = Rational(static_cast<int64_t>(std::numbers::pi * precision), precision);
+    variables["e"]  = Rational(static_cast<int64_t>(std::numbers::e * precision), precision);
 
-    std::cout << "C++20関数電卓 (exitで終了)" << std::endl;
+    std::cout << "有理数関数電卓 (exitで終了)" << std::endl;
 
     std::string line;
     while (std::cout << "> " && std::getline(std::cin, line)) {
@@ -698,10 +830,19 @@ int main() {
 
             if (pegtl::parse<calculator::grammar, calculator::action>(input, state)) {
                 auto result = state.get_result();
-                double value = result->eval(variables);
-                // FunctionDefinitionNode の場合は、内部でメッセージを出力しているため結果を表示しない
+                Rational value = result->eval(variables);
+
+                // FunctionDefinitionNode の場合は結果を表示しない
                 if (dynamic_cast<FunctionDefinitionNode*>(result.get()) == nullptr) {
-                    std::cout << "= " << value << std::endl;
+                    double double_value = boost::rational_cast<double>(value);
+                    std::cout << "= " << double_value;
+
+                    // 分母が1の場合（整数の場合）は分数表記を省略
+                    if (value.denominator() != 1) {
+                        std::cout << " (分数表現: " << value.numerator() 
+                                  << "/" << value.denominator() << ")";
+                    }
+                    std::cout << std::endl;
                 }
             } else {
                 std::cerr << "構文解析エラー：結果が得られませんでした" << std::endl;
