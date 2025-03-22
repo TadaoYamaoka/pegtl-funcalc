@@ -68,6 +68,7 @@ public:
     }
 };
 
+// 単項演算子ノード
 class UnaryOpNode : public ASTNode {
     char op_;
     std::unique_ptr<ASTNode> operand_;
@@ -280,10 +281,15 @@ namespace calculator {
     struct power_op : seq<spaces, power_operator, spaces, unary> {};
     struct power : seq<unary, star<power_op>> {};
 
-    // 乗除算と剰余
+    // 乗除算（明示的な演算子）用
     struct mul_operator : one<'*', '/', '%'> {}; 
     struct mul_op : seq<spaces, mul_operator, spaces, power> {};
-    struct multiplication : seq<power, star<mul_op>> {};
+
+    // 暗黙の乗算ルール：直後が数字、識別子、または '(' で始まる場合に適用
+    struct implicit_mul : seq< spaces, at< sor< digit, identifier, one<'('> > >, power > {};
+
+    // 明示的な乗算と暗黙の乗算のいずれかを複数繰り返し可能にする
+    struct multiplication : seq<power, star< sor< mul_op, implicit_mul > > > {};
 
     // 加減算
     struct add_operator : one<'+', '-'> {};
@@ -347,7 +353,7 @@ namespace calculator {
         }
     };
 
-    // 最初の引数の処理（入れ子でも arg_lists が空でなければ処理）
+    // 最初の引数の処理
     template<>
     struct action<func_arg> {
         template<typename ActionInput>
@@ -466,7 +472,7 @@ namespace calculator {
         }
     };
 
-    // 乗除算：演算子を記録
+    // 乗除算（明示的な演算子）の処理
     template<>
     struct action<mul_operator> {
         template<typename ActionInput>
@@ -475,7 +481,7 @@ namespace calculator {
         }
     };
 
-    // 乗除算：左結合で AST を構築
+    // 乗除算：左結合で AST を構築（明示的な演算子）
     template<>
     struct action<mul_op> {
         template<typename ActionInput>
@@ -487,6 +493,21 @@ namespace calculator {
             auto left = std::move(state.values.back());
             state.values.pop_back();
             state.values.push_back(std::make_unique<BinaryOpNode>(state.pop_operator(), std::move(left), std::move(right)));
+        }
+    };
+
+    // 暗黙の乗算：'*' を自動的に挿入する
+    template<>
+    struct action<implicit_mul> {
+        template<typename ActionInput>
+        static void apply(const ActionInput& /*in*/, ParserState& state) {
+            if (state.values.size() < 2)
+                throw std::runtime_error("暗黙の乗算の構文エラー");
+            auto right = std::move(state.values.back());
+            state.values.pop_back();
+            auto left = std::move(state.values.back());
+            state.values.pop_back();
+            state.values.push_back(std::make_unique<BinaryOpNode>('*', std::move(left), std::move(right)));
         }
     };
 
