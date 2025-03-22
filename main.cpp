@@ -6,6 +6,7 @@
 #include <memory>
 #include <vector>
 #include <functional>
+#include <algorithm>
 #include <tao/pegtl.hpp>
 
 namespace pegtl = tao::pegtl;
@@ -330,10 +331,13 @@ namespace calculator {
     struct prefixed_unary : seq<unary_operator, spaces, sor<primary, prefixed_unary>> {};
     struct unary : sor<prefixed_unary, primary> {};
 
-    // べき乗演算
-    struct power_operator : one<'^'> {};
-    struct power_op : seq<spaces, power_operator, spaces, unary> {};
-    struct power : seq<unary, star<power_op>> {};
+    // べき乗演算子（右結合）用の定義
+    // まず、べき乗の開始位置を示すマーカーを入れる
+    struct marker : success {};
+    // べき乗の右辺部分： '^' と単項式の組
+    struct power_tail : star<seq<spaces, one<'^'>, spaces, unary>> {};
+    // べき乗は、マーカー、単項式、続く power_tail からなる
+    struct power : seq< marker, unary, power_tail > {};
 
     // 乗除算（明示的な演算子）用
     struct mul_operator : one<'*', '/', '%'> {};
@@ -476,27 +480,44 @@ namespace calculator {
         }
     };
 
-    // べき乗演算子
+    // べき乗演算（右結合）用アクション
+    // marker ルール：スタックに nullptr をプッシュ
     template<>
-    struct action<power_operator> {
+    struct action<marker> {
         template<typename ActionInput>
-        static void apply(const ActionInput& in, ParserState& state) {
-            state.push_operator(in.string()[0]);
+        static void apply(const ActionInput& /*in*/, ParserState& state) {
+            state.values.push_back(nullptr);
         }
     };
 
-    // べき乗演算
+    // power ルール：marker から始まる部分の AST を右結合で畳み込む
     template<>
-    struct action<power_op> {
+    struct action<power> {
         template<typename ActionInput>
         static void apply(const ActionInput& /*in*/, ParserState& state) {
-            if (state.values.size() < 2)
-                throw std::runtime_error("べき乗演算子の構文エラー");
-            auto right = std::move(state.values.back());
-            state.values.pop_back();
-            auto left = std::move(state.values.back());
-            state.values.pop_back();
-            state.values.push_back(std::make_unique<BinaryOpNode>(state.pop_operator(), std::move(left), std::move(right)));
+            // state.values に、marker の後に並んだ AST ノードが積まれている
+            std::vector<std::unique_ptr<ASTNode>> nodes;
+            while (!state.values.empty()) {
+                auto node = std::move(state.values.back());
+                state.values.pop_back();
+                if (!node) { // marker が見つかった
+                    break;
+                }
+                nodes.push_back(std::move(node));
+            }
+            // nodes は逆順になっているので、元の順に戻す
+            std::reverse(nodes.begin(), nodes.end());
+            if (nodes.empty()) {
+                throw std::runtime_error("べき乗演算子の構文エラー: ノードがありません");
+            }
+            // 右結合：右端から畳み込む
+            std::unique_ptr<ASTNode> result = std::move(nodes.back());
+            nodes.pop_back();
+            while (!nodes.empty()) {
+                result = std::make_unique<BinaryOpNode>('^', std::move(nodes.back()), std::move(result));
+                nodes.pop_back();
+            }
+            state.values.push_back(std::move(result));
         }
     };
 
