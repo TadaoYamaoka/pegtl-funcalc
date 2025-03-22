@@ -9,20 +9,26 @@
 #include <algorithm>
 #include <tao/pegtl.hpp>
 #include <boost/rational.hpp>
+#include <boost/multiprecision/cpp_int.hpp>
+#include <boost/multiprecision/cpp_dec_float.hpp>
 
 namespace pegtl = tao::pegtl;
+namespace mp = boost::multiprecision;
 
 // 有理数型の定義
-using Rational = boost::rational<int64_t>;
+using Rational = boost::rational<mp::cpp_int>;
+// 高精度浮動小数点型（超越関数計算用）
+using cpp_dec_float = mp::cpp_dec_float_100;
+// 変換精度（10^100の精度）
+const mp::cpp_int precision = mp::pow(mp::cpp_int(10), 100);
 
 // 文字列から有理数への変換ヘルパー関数
 Rational stringToRational(const std::string& str) {
-    // 科学的表記法を扱う場合は一時的にdoubleへ変換
+    // 科学的表記法を扱う場合は一時的に高精度浮動小数点数へ変換
     if (str.find('e') != std::string::npos || str.find('E') != std::string::npos) {
-        double d = std::stod(str);
+        cpp_dec_float d(str);
         // 十分な精度で有理数に近似
-        const int64_t precision = 1000000000;
-        return Rational(static_cast<int64_t>(d * precision), precision);
+        return Rational(mp::cpp_int(d * cpp_dec_float(precision)), precision);
     }
 
     // 小数点を含む場合は分子と分母を計算
@@ -39,15 +45,23 @@ Rational stringToRational(const std::string& str) {
         }
 
         // 分子 = 整数部 * 10^(小数部の桁数) + 小数部
-        int64_t numerator = 0;
+        mp::cpp_int numerator = 0;
         if (!int_part.empty()) {
-            numerator = std::stoll(int_part);
+            numerator = mp::cpp_int(int_part);
         }
-        numerator = numerator * static_cast<int64_t>(std::pow(10, frac_part.length())) + 
-                   (frac_part.empty() ? 0 : std::stoll(frac_part));
+
+        mp::cpp_int multiplier = 1;
+        for (size_t i = 0; i < frac_part.length(); ++i) {
+            multiplier *= 10;
+        }
+
+        numerator = numerator * multiplier;
+        if (!frac_part.empty()) {
+            numerator += mp::cpp_int(frac_part);
+        }
 
         // 分母 = 10^(小数部の桁数)
-        int64_t denominator = static_cast<int64_t>(std::pow(10, frac_part.length()));
+        mp::cpp_int denominator = multiplier;
 
         // 符号を適用
         if (negative) {
@@ -57,7 +71,7 @@ Rational stringToRational(const std::string& str) {
         return Rational(numerator, denominator);
     } else {
         // 整数の場合
-        return Rational(std::stoll(str));
+        return Rational(mp::cpp_int(str));
     }
 }
 
@@ -117,37 +131,58 @@ public:
                     throw std::runtime_error("ゼロ除算エラー");
                 return lval / rval;
             case '^': {
-                // べき乗は整数の場合のみ正確に計算、それ以外は近似
+                // べき乗は整数の場合のみ正確に計算
                 if (rval.denominator() == 1) {
-                    // 整数のべき乗
-                    int64_t exp = rval.numerator();
+                    mp::cpp_int exp = rval.numerator();
                     bool neg_exp = exp < 0;
-                    exp = std::abs(exp);
+                    exp = mp::abs(exp);
 
-                    Rational result(1);
-                    for (int64_t i = 0; i < exp; ++i) {
-                        result *= lval;
-                    }
+                    // 整数のべき乗を計算
+                    if (exp <= std::numeric_limits<unsigned int>::max()) {
+                        // boost::multiprecisionの特化版を利用
+                        unsigned int uint_exp = static_cast<unsigned int>(exp.convert_to<unsigned int>());
+                        if (neg_exp) {
+                            return Rational(1) / Rational(mp::pow(lval.numerator() * rval.denominator(), uint_exp),
+                                                         mp::pow(lval.denominator() * rval.numerator(), uint_exp));
+                        } else {
+                            return Rational(mp::pow(lval.numerator(), uint_exp),
+                                           mp::pow(lval.denominator(), uint_exp));
+                        }
+                    } else {
+                        // 大きな指数の場合はループ計算
+                        Rational result(1);
+                        for (mp::cpp_int i = 0; i < exp; ++i) {
+                            result *= lval;
+                        }
 
-                    if (neg_exp) {
-                        return Rational(1) / result;
+                        if (neg_exp) {
+                            return Rational(1) / result;
+                        }
+                        return result;
                     }
-                    return result;
                 } else {
-                    // 浮動小数点数に変換して計算し、有理数に戻す
-                    double lval_d = boost::rational_cast<double>(lval);
-                    double rval_d = boost::rational_cast<double>(rval);
-                    double result_d = std::pow(lval_d, rval_d);
-                    const int64_t precision = 1000000000;
-                    return Rational(static_cast<int64_t>(result_d * precision), precision);
+                    // 有理数のべき乗は高精度浮動小数点を使って近似
+                    cpp_dec_float lval_f = cpp_dec_float(lval.numerator()) / cpp_dec_float(lval.denominator());
+                    cpp_dec_float rval_f = cpp_dec_float(rval.numerator()) / cpp_dec_float(rval.denominator());
+                    cpp_dec_float result_f = mp::pow(lval_f, rval_f);
+
+                    // 結果を有理数に変換
+                    cpp_dec_float scaled = result_f * cpp_dec_float(precision);
+                    return Rational(mp::cpp_int(scaled), precision);
                 }
             }
             case '%':
                 if (rval.numerator() == 0)
                     throw std::runtime_error("ゼロでの剰余演算エラー");
-                // 有理数の剰余演算
-                return Rational(lval.numerator() * rval.denominator() % (rval.numerator() * lval.denominator()),
-                               lval.denominator() * rval.denominator());
+                // 浮動小数点数に変換してから計算
+                {
+                    cpp_dec_float lval_f = cpp_dec_float(lval.numerator()) / cpp_dec_float(lval.denominator());
+                    cpp_dec_float rval_f = cpp_dec_float(rval.numerator()) / cpp_dec_float(rval.denominator());
+                    cpp_dec_float result_f = mp::fmod(lval_f, rval_f);
+
+                    // 結果を有理数に変換
+                    return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+                }
             default:
                 throw std::runtime_error("無効な演算子");
         }
@@ -179,70 +214,130 @@ public:
 
     Rational eval(std::map<std::string, Rational>& vars) override {
         Rational arg_val = arg_->eval(vars);
-        double arg_d = boost::rational_cast<double>(arg_val);
-        double result_d;
-        const int64_t precision = 1000000000;
 
         // 数学関数
-        if (name_ == "sqrt")  result_d = std::sqrt(arg_d);
-        else if (name_ == "log")   result_d = std::log(arg_d);
-        else if (name_ == "exp")   result_d = std::exp(arg_d);
-        else if (name_ == "abs")   {
-            // absは有理数でそのまま計算可能
-            return Rational(std::abs(arg_val.numerator()), std::abs(arg_val.denominator()));
+        if (name_ == "sqrt") {
+            // 有理数の平方根は高精度浮動小数点で計算
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::sqrt(arg_f);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
         }
-        else if (name_ == "log2")  result_d = std::log2(arg_d);
-        else if (name_ == "log10") result_d = std::log10(arg_d);
-        else if (name_ == "cbrt")  result_d = std::cbrt(arg_d);
-        else if (name_ == "exp2")  result_d = std::exp2(arg_d);
-        else if (name_ == "expm1") result_d = std::expm1(arg_d);
-        else if (name_ == "log1p") result_d = std::log1p(arg_d);
-        else if (name_ == "erf")   result_d = std::erf(arg_d);
-        else if (name_ == "erfc")  result_d = std::erfc(arg_d);
+        else if (name_ == "log") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::log(arg_f);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
+        else if (name_ == "exp") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::exp(arg_f);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
+        else if (name_ == "abs") {
+            // absは有理数でそのまま計算可能
+            return Rational(mp::abs(arg_val.numerator()), mp::abs(arg_val.denominator()));
+        }
+        else if (name_ == "log2") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::log(arg_f) / mp::log(cpp_dec_float(2));
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
+        else if (name_ == "log10") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::log10(arg_f);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
+        else if (name_ == "cbrt") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::pow(arg_f, cpp_dec_float(1) / cpp_dec_float(3));
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
+        else if (name_ == "exp2") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::pow(cpp_dec_float(2), arg_f);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
+        else if (name_ == "expm1") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::exp(arg_f) - cpp_dec_float(1);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
+        else if (name_ == "log1p") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::log(cpp_dec_float(1) + arg_f);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
         // 三角関数
-        else if (name_ == "sin")   result_d = std::sin(arg_d);
-        else if (name_ == "cos")   result_d = std::cos(arg_d);
-        else if (name_ == "tan")   result_d = std::tan(arg_d);
+        else if (name_ == "sin") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::sin(arg_f);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
+        else if (name_ == "cos") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::cos(arg_f);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
+        else if (name_ == "tan") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::tan(arg_f);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
         // 逆三角関数
-        else if (name_ == "asin")  result_d = std::asin(arg_d);
-        else if (name_ == "acos")  result_d = std::acos(arg_d);
-        else if (name_ == "atan")  result_d = std::atan(arg_d);
+        else if (name_ == "asin") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::asin(arg_f);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
+        else if (name_ == "acos") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::acos(arg_f);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
+        else if (name_ == "atan") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::atan(arg_f);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
         // 双曲線関数
-        else if (name_ == "sinh")  result_d = std::sinh(arg_d);
-        else if (name_ == "cosh")  result_d = std::cosh(arg_d);
-        else if (name_ == "tanh")  result_d = std::tanh(arg_d);
-        // 逆双曲線関数
-        else if (name_ == "asinh") result_d = std::asinh(arg_d);
-        else if (name_ == "acosh") result_d = std::acosh(arg_d);
-        else if (name_ == "atanh") result_d = std::atanh(arg_d);
+        else if (name_ == "sinh") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::sinh(arg_f);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
+        else if (name_ == "cosh") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::cosh(arg_f);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
+        else if (name_ == "tanh") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::tanh(arg_f);
+            return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
+        }
         // 丸め関数
-        else if (name_ == "ceil")  {
-            // 有理数のceil演算
-            int64_t num = arg_val.numerator();
-            int64_t den = arg_val.denominator();
-            if (num % den == 0) return Rational(num / den);
-            return Rational(num / den + (num > 0 ? 1 : 0));
+        else if (name_ == "ceil") {
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::ceil(arg_f);
+            // 整数値として返す
+            return Rational(mp::cpp_int(result_f), 1);
         }
         else if (name_ == "floor") {
-            // 有理数のfloor演算
-            int64_t num = arg_val.numerator();
-            int64_t den = arg_val.denominator();
-            if (num % den == 0) return Rational(num / den);
-            return Rational(num / den - (num < 0 ? 1 : 0));
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::floor(arg_f);
+            // 整数値として返す
+            return Rational(mp::cpp_int(result_f), 1);
         }
         else if (name_ == "round") {
-            // 有理数のround演算
-            int64_t num = arg_val.numerator();
-            int64_t den = arg_val.denominator();
-            int64_t quot = num / den;
-            int64_t rem = std::abs(num % den);
-            if (2 * rem >= den)
-                return Rational(quot + (num >= 0 ? 1 : -1));
-            return Rational(quot);
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::round(arg_f);
+            // 整数値として返す
+            return Rational(mp::cpp_int(result_f), 1);
         }
         else if (name_ == "trunc") {
-            // 有理数のtrunc演算
-            return Rational(arg_val.numerator() / arg_val.denominator());
+            cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            cpp_dec_float result_f = mp::trunc(arg_f);
+            // 整数値として返す
+            return Rational(mp::cpp_int(result_f), 1);
         }
         // ユーザー定義関数（1引数）
         else {
@@ -256,9 +351,6 @@ public:
             }
             throw std::runtime_error("未定義の関数: " + name_);
         }
-
-        // 結果を有理数に近似変換
-        return Rational(static_cast<int64_t>(result_d * precision), precision);
     }
 };
 
@@ -280,28 +372,48 @@ public:
             if (arg_vals.size() != 2)
                 throw std::runtime_error("pow関数は2つの引数が必要です");
 
-            // pow関数は整数のべき乗のみ正確計算
+            // pow関数は整数のべき乗の場合、専用の実装を使用
             if (arg_vals[1].denominator() == 1) {
-                int64_t exp = arg_vals[1].numerator();
+                mp::cpp_int exp = arg_vals[1].numerator();
                 bool neg_exp = exp < 0;
-                exp = std::abs(exp);
+                exp = mp::abs(exp);
 
-                Rational result(1);
-                for (int64_t i = 0; i < exp; ++i) {
-                    result *= arg_vals[0];
-                }
+                // 小さい指数の場合はBoostの特化版を使用
+                if (exp <= std::numeric_limits<unsigned int>::max()) {
+                    unsigned int uint_exp = static_cast<unsigned int>(exp.convert_to<unsigned int>());
+                    Rational result;
 
-                if (neg_exp) {
-                    return Rational(1) / result;
+                    if (neg_exp) {
+                        result = Rational(1) / Rational(
+                            mp::pow(arg_vals[0].numerator(), uint_exp),
+                            mp::pow(arg_vals[0].denominator(), uint_exp)
+                        );
+                    } else {
+                        result = Rational(
+                            mp::pow(arg_vals[0].numerator(), uint_exp),
+                            mp::pow(arg_vals[0].denominator(), uint_exp)
+                        );
+                    }
+                    return result;
+                } else {
+                    // 大きな指数の場合はループ計算
+                    Rational result(1);
+                    for (mp::cpp_int i = 0; i < exp; ++i) {
+                        result *= arg_vals[0];
+                    }
+
+                    if (neg_exp) {
+                        return Rational(1) / result;
+                    }
+                    return result;
                 }
-                return result;
             } else {
-                // 浮動小数点数に変換して計算
-                double base = boost::rational_cast<double>(arg_vals[0]);
-                double exponent = boost::rational_cast<double>(arg_vals[1]);
-                double result = std::pow(base, exponent);
-                const int64_t precision = 1000000000;
-                return Rational(static_cast<int64_t>(result * precision), precision);
+                // 有理数指数の場合は高精度浮動小数点数を使用
+                cpp_dec_float base = cpp_dec_float(arg_vals[0].numerator()) / cpp_dec_float(arg_vals[0].denominator());
+                cpp_dec_float exponent = cpp_dec_float(arg_vals[1].numerator()) / cpp_dec_float(arg_vals[1].denominator());
+                cpp_dec_float result = mp::pow(base, exponent);
+
+                return Rational(mp::cpp_int(result * cpp_dec_float(precision)), precision);
             }
         }
 
@@ -321,6 +433,32 @@ public:
             for (size_t i = 1; i < arg_vals.size(); ++i)
                 if (arg_vals[i] < min_val) min_val = arg_vals[i];
             return min_val;
+        }
+
+        // atan2関数のサポート
+        if (name_ == "atan2") {
+            if (arg_vals.size() != 2)
+                throw std::runtime_error("atan2関数は2つの引数が必要です");
+
+            cpp_dec_float y = cpp_dec_float(arg_vals[0].numerator()) / cpp_dec_float(arg_vals[0].denominator());
+            cpp_dec_float x = cpp_dec_float(arg_vals[1].numerator()) / cpp_dec_float(arg_vals[1].denominator());
+            cpp_dec_float result = mp::atan2(y, x);
+
+            return Rational(mp::cpp_int(result * cpp_dec_float(precision)), precision);
+        }
+
+        // ldexp関数のサポート
+        if (name_ == "ldexp") {
+            if (arg_vals.size() != 2)
+                throw std::runtime_error("ldexp関数は2つの引数が必要です");
+            if (arg_vals[1].denominator() != 1)
+                throw std::runtime_error("ldexpの第2引数は整数である必要があります");
+
+            int exp = static_cast<int>(arg_vals[1].numerator().convert_to<int>());
+            cpp_dec_float x = cpp_dec_float(arg_vals[0].numerator()) / cpp_dec_float(arg_vals[0].denominator());
+            cpp_dec_float result = mp::ldexp(x, exp);
+
+            return Rational(mp::cpp_int(result * cpp_dec_float(precision)), precision);
         }
 
         // ユーザー定義関数（複数引数）
@@ -813,9 +951,10 @@ int main() {
     std::map<std::string, Rational> variables;
 
     // 定数の事前定義
-    const int64_t precision = 1000000000;
-    variables["pi"] = Rational(static_cast<int64_t>(std::numbers::pi * precision), precision);
-    variables["e"]  = Rational(static_cast<int64_t>(std::numbers::e * precision), precision);
+    cpp_dec_float pi_value = boost::math::constants::pi<cpp_dec_float>();
+    cpp_dec_float e_value = boost::math::constants::e<cpp_dec_float>();
+    variables["pi"] = Rational(mp::cpp_int(pi_value * cpp_dec_float(precision)), precision);
+    variables["e"]  = Rational(mp::cpp_int(e_value * cpp_dec_float(precision)), precision);
 
     std::cout << "有理数関数電卓 (exitで終了)" << std::endl;
 
@@ -841,6 +980,9 @@ int main() {
                     if (value.denominator() != 1) {
                         std::cout << " (分数表現: " << value.numerator() 
                                   << "/" << value.denominator() << ")";
+                    } else {
+                        // 整数値の場合は、cpp_intの値をそのまま表示
+                        std::cout << " (整数値: " << value.numerator() << ")";
                     }
                     std::cout << std::endl;
                 }
