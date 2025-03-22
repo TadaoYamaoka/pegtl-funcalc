@@ -21,7 +21,7 @@ class NumberNode : public ASTNode {
     double value_;
 public:
     NumberNode(double value) : value_(value) {}
-    double eval(std::map<std::string, double>& vars) const override { return value_; }
+    double eval(std::map<std::string, double>& /*vars*/) const override { return value_; }
 };
 
 // 変数参照ノード
@@ -52,11 +52,27 @@ public:
             case '+': return lval + rval;
             case '-': return lval - rval;
             case '*': return lval * rval;
-            case '/': 
-                if (rval == 0) throw std::runtime_error("ゼロ除算エラー");
+            case '/':
+                if (rval == 0)
+                    throw std::runtime_error("ゼロ除算エラー");
                 return lval / rval;
-            default: throw std::runtime_error("無効な演算子");
+            default:
+                throw std::runtime_error("無効な演算子");
         }
+    }
+};
+
+class UnaryOpNode : public ASTNode {
+    char op_;
+    std::unique_ptr<ASTNode> operand_;
+public:
+    UnaryOpNode(char op, std::unique_ptr<ASTNode> operand)
+        : op_(op), operand_(std::move(operand)) {}
+    double eval(std::map<std::string, double>& vars) const override {
+        double val = operand_->eval(vars);
+        if (op_ == '-') return -val;
+        if (op_ == '+') return val;
+        throw std::runtime_error("無効な単項演算子");
     }
 };
 
@@ -103,13 +119,27 @@ struct ParserState {
     std::vector<std::unique_ptr<ASTNode>> values;  // 値のスタック
     bool in_function_call = false;                 // 関数呼び出し処理中フラグ
     std::string current_function_name;             // 現在処理中の関数名
-    char temp_op;                                  // 二項演算子一時保管用
+    std::vector<char> ops;                         // 演算子のスタック
+    char temp_unary_op = 0;                        // 単項演算子の一時保管用
+
+    // 演算子を追加
+    void push_operator(char op) {
+        ops.push_back(op);
+    }
+
+    // 最後の演算子を取得して削除
+    char pop_operator() {
+        if (ops.empty())
+            throw std::runtime_error("演算子スタックが空です");
+        char op = ops.back();
+        ops.pop_back();
+        return op;
+    }
 
     // 評価結果を取得
     std::unique_ptr<ASTNode> get_result() {
-        if (values.size() != 1) {
+        if (values.size() != 1)
             throw std::runtime_error("構文エラー: 式が正しく構築されていません");
-        }
         return std::move(values.back());
     }
 };
@@ -120,6 +150,7 @@ namespace calculator {
 
     // 前方宣言
     struct expr;
+    struct unary;
 
     // 基本ルール
     struct ws : one<' ', '\t'> {};
@@ -149,10 +180,15 @@ namespace calculator {
     // 一次式
     struct primary : sor<number, function_call, var, parenthesized> {};
 
+    // 単項演算子および単項式
+    struct unary_operator : one<'-', '+'> {};
+    struct prefixed_unary : seq<unary_operator, spaces, unary> {};
+    struct unary : sor<prefixed_unary, primary> {};
+
     // 乗除算
     struct mul_operator : one<'*', '/'> {};
-    struct mul_op : seq<spaces, mul_operator, spaces, primary> {};
-    struct multiplication : seq<primary, star<mul_op>> {};
+    struct mul_op : seq<spaces, mul_operator, spaces, unary> {};
+    struct multiplication : seq<unary, star<mul_op>> {};
 
     // 加減算
     struct add_operator : one<'+', '-'> {};
@@ -199,12 +235,11 @@ namespace calculator {
         }
     };
 
-    // 関数呼び出し：関数名の取得
+    // 関数呼び出し：関数名を記録
     template<>
     struct action<func_name> {
         template<typename ActionInput>
         static void apply(const ActionInput& in, ParserState& state) {
-            // 関数名を記録
             state.current_function_name = in.string();
             state.in_function_call = true;
         }
@@ -214,8 +249,7 @@ namespace calculator {
     template<>
     struct action<func_args> {
         template<typename ActionInput>
-        static void apply(const ActionInput& in, ParserState& state) {
-            // 関数呼び出しの処理完了
+        static void apply(const ActionInput& /*in*/, ParserState& state) {
             state.in_function_call = false;
         }
     };
@@ -225,28 +259,46 @@ namespace calculator {
     struct action<function_call> {
         template<typename ActionInput>
         static void apply(const ActionInput& /*in*/, ParserState& state) {
-            if (state.values.empty()) {
+            if (state.values.empty())
                 throw std::runtime_error("関数呼び出しの構文が不正です");
-            }
-    
-            // 引数は既にスタックの最上部にある
             auto arg = std::move(state.values.back());
             state.values.pop_back();
-            // 関数ノードを作成してスタックに追加
             state.values.push_back(std::make_unique<FunctionNode>(state.current_function_name, std::move(arg)));
         }
     };
 
-    // 加減算：演算子取得
+    // 単項演算子：演算子を記録
+    template<>
+    struct action<unary_operator> {
+        template<typename ActionInput>
+        static void apply(const ActionInput& in, ParserState& state) {
+            state.temp_unary_op = in.string()[0];
+        }
+    };
+
+    // 単項演算子付き式：UnaryOpNode を生成
+    template<>
+    struct action<prefixed_unary> {
+        template<typename ActionInput>
+        static void apply(const ActionInput& /*in*/, ParserState& state) {
+            if (state.values.empty())
+                throw std::runtime_error("単項演算子の構文エラー");
+            auto operand = std::move(state.values.back());
+            state.values.pop_back();
+            state.values.push_back(std::make_unique<UnaryOpNode>(state.temp_unary_op, std::move(operand)));
+        }
+    };
+
+    // 加減算：演算子を記録
     template<>
     struct action<add_operator> {
         template<typename ActionInput>
         static void apply(const ActionInput& in, ParserState& state) {
-            state.temp_op = in.string()[0];
+            state.push_operator(in.string()[0]);
         }
     };
 
-    // 加減算：左結合で AST を構築
+    // 加減算：左結合で AST を構築（BinaryOpNode の生成）
     template<>
     struct action<add_op> {
         template<typename ActionInput>
@@ -257,20 +309,20 @@ namespace calculator {
             state.values.pop_back();
             auto left = std::move(state.values.back());
             state.values.pop_back();
-            state.values.push_back(std::make_unique<BinaryOpNode>(state.temp_op, std::move(left), std::move(right)));
+            state.values.push_back(std::make_unique<BinaryOpNode>(state.pop_operator(), std::move(left), std::move(right)));
         }
     };
 
-    // 乗除算：演算子取得
+    // 乗除算：演算子を記録
     template<>
     struct action<mul_operator> {
         template<typename ActionInput>
         static void apply(const ActionInput& in, ParserState& state) {
-            state.temp_op = in.string()[0];
+            state.push_operator(in.string()[0]);
         }
     };
 
-    // 乗除算：左結合で AST を構築
+    // 乗除算：左結合で AST を構築（BinaryOpNode の生成）
     template<>
     struct action<mul_op> {
         template<typename ActionInput>
@@ -281,11 +333,11 @@ namespace calculator {
             state.values.pop_back();
             auto left = std::move(state.values.back());
             state.values.pop_back();
-            state.values.push_back(std::make_unique<BinaryOpNode>(state.temp_op, std::move(left), std::move(right)));
+            state.values.push_back(std::make_unique<BinaryOpNode>(state.pop_operator(), std::move(left), std::move(right)));
         }
     };
 
-    // 代入：入力全体から左辺を抽出して AssignmentNode を生成
+    // 代入：右辺を取り出し、変数名を抽出して AssignmentNode を生成
     template<>
     struct action<assignment> {
         template<typename ActionInput>
