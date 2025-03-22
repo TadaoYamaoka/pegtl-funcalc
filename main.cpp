@@ -103,13 +103,46 @@ public:
     double eval(std::map<std::string, double>& vars) override {
         double arg_val = arg_->eval(vars);
 
-        if (name_ == "sin") return std::sin(arg_val);
-        if (name_ == "cos") return std::cos(arg_val);
-        if (name_ == "tan") return std::tan(arg_val);
-        if (name_ == "sqrt") return std::sqrt(arg_val);
-        if (name_ == "log") return std::log(arg_val);
-        if (name_ == "exp") return std::exp(arg_val);
-        if (name_ == "abs") return std::abs(arg_val);
+        // 数学関数
+        if (name_ == "sqrt")  return std::sqrt(arg_val);
+        if (name_ == "log")   return std::log(arg_val);
+        if (name_ == "exp")   return std::exp(arg_val);
+        if (name_ == "abs")   return std::abs(arg_val);
+        if (name_ == "log2")  return std::log2(arg_val);
+        if (name_ == "log10") return std::log10(arg_val);
+        if (name_ == "cbrt")  return std::cbrt(arg_val);
+        if (name_ == "exp2")  return std::exp2(arg_val);
+        if (name_ == "expm1") return std::expm1(arg_val);
+        if (name_ == "log1p") return std::log1p(arg_val);
+        if (name_ == "erf")   return std::erf(arg_val);
+        if (name_ == "erfc")  return std::erfc(arg_val);
+
+        // 三角関数
+        if (name_ == "sin")   return std::sin(arg_val);
+        if (name_ == "cos")   return std::cos(arg_val);
+        if (name_ == "tan")   return std::tan(arg_val);
+
+        // 逆三角関数
+        if (name_ == "asin")  return std::asin(arg_val);
+        if (name_ == "acos")  return std::acos(arg_val);
+        if (name_ == "atan")  return std::atan(arg_val);
+    
+        // 双曲線関数
+        if (name_ == "sinh")  return std::sinh(arg_val);
+        if (name_ == "cosh")  return std::cosh(arg_val);
+        if (name_ == "tanh")  return std::tanh(arg_val);
+    
+        // 逆双曲線関数
+        if (name_ == "asinh") return std::asinh(arg_val);
+        if (name_ == "acosh") return std::acosh(arg_val);
+        if (name_ == "atanh") return std::atanh(arg_val);
+
+        // 丸め関数
+        if (name_ == "ceil")  return std::ceil(arg_val);
+        if (name_ == "floor") return std::floor(arg_val);
+        if (name_ == "round") return std::round(arg_val);
+        if (name_ == "trunc") return std::trunc(arg_val);
+
         // ユーザー定義関数（1引数）
         auto it = userFunctions.find(name_);
         if (it != userFunctions.end()) {
