@@ -101,79 +101,16 @@ public:
 // パーサーの状態
 struct ParserState {
     std::vector<std::unique_ptr<ASTNode>> values;  // 値のスタック
-    std::vector<char> operators;                   // 演算子のスタック
     bool in_function_call = false;                 // 関数呼び出し処理中フラグ
     std::string current_function_name;             // 現在処理中の関数名
-
-    // 演算子をプッシュ（優先順位を考慮）
-    void push_operator(char op) {
-        while (!operators.empty() && precedence(operators.back()) >= precedence(op) && operators.back() != '(') {
-            apply_operator();
-        }
-        operators.push_back(op);
-    }
-
-    // 括弧内の式を終了
-    void close_parenthesis() {
-        while (!operators.empty() && operators.back() != '(') {
-            apply_operator();
-        }
-
-        if (!operators.empty() && operators.back() == '(') {
-            operators.pop_back(); // 開き括弧を削除
-        }
-    }
-
-    // 最上位の演算子を適用
-    void apply_operator() {
-        if (operators.empty() || values.size() < 2) return;
-
-        char op = operators.back();
-        operators.pop_back();
-
-        auto right = std::move(values.back());
-        values.pop_back();
-
-        auto left = std::move(values.back());
-        values.pop_back();
-
-        values.push_back(std::make_unique<BinaryOpNode>(op, std::move(left), std::move(right)));
-    }
-
-    // 残りの演算子をすべて適用
-    void apply_remaining_operators() {
-        while (!operators.empty()) {
-            if (operators.back() == '(') {
-                operators.pop_back(); // 未対応の開き括弧は無視
-                continue;
-            }
-            apply_operator();
-        }
-    }
-
-    // 演算子の優先順位
-    int precedence(char op) const {
-        switch (op) {
-            case '+':
-            case '-': return 1;
-            case '*':
-            case '/': return 2;
-            default: return 0;
-        }
-    }
+    char temp_op;                                  // 二項演算子一時保管用
 
     // 評価結果を取得
     std::unique_ptr<ASTNode> get_result() {
-        apply_remaining_operators();
-
-        if (values.empty()) {
-            return nullptr;
+        if (values.size() != 1) {
+            throw std::runtime_error("構文エラー: 式が正しく構築されていません");
         }
-        if (values.size() > 1) {
-            throw std::runtime_error("構文エラー: 複数の式が残っています");
-        }
-
-        return std::move(values[0]);
+        return std::move(values.back());
     }
 };
 
@@ -181,23 +118,27 @@ struct ParserState {
 namespace calculator {
     using namespace pegtl;
 
+    // 前方宣言
+    struct expr;
+
     // 基本ルール
     struct ws : one<' ', '\t'> {};
     struct spaces : star<ws> {};
-
-    struct plus_minus : one<'+', '-'> {};
-    struct mult_div : one<'*', '/'> {};
 
     struct integer : plus<digit> {};
     struct decimal : seq<opt<one<'+', '-'>>, integer, opt<seq<one<'.'>, star<digit>>>> {};
     struct number : decimal {};
 
+    // 識別子（基本ルール）
     struct identifier : seq<ranges<'a', 'z', 'A', 'Z'>, star<ranges<'a', 'z', 'A', 'Z', '0', '9'>>> {};
 
-    // 前方宣言
-    struct expr;
+    // 変数参照用（右辺）
+    struct var : identifier {};
 
-    // 関数呼び出し - 関数名を明示的に捕捉
+    // 代入左辺用（区別のため）
+    struct assign_id : identifier {};
+
+    // 関数呼び出し
     struct func_name : identifier {};
     struct func_args : if_must<one<'('>, spaces, expr, spaces, one<')'>> {};
     struct function_call : seq<func_name, spaces, func_args> {};
@@ -206,16 +147,20 @@ namespace calculator {
     struct parenthesized : if_must<one<'('>, spaces, expr, spaces, one<')'>> {};
 
     // 一次式
-    struct primary : sor<number, function_call, identifier, parenthesized> {};
+    struct primary : sor<number, function_call, var, parenthesized> {};
 
     // 乗除算
-    struct multiplication : list<primary, seq<spaces, mult_div, spaces>> {};
+    struct mul_operator : one<'*', '/'> {};
+    struct mul_op : seq<spaces, mul_operator, spaces, primary> {};
+    struct multiplication : seq<primary, star<mul_op>> {};
 
     // 加減算
-    struct addition : list<multiplication, seq<spaces, plus_minus, spaces>> {};
+    struct add_operator : one<'+', '-'> {};
+    struct add_op : seq<spaces, add_operator, spaces, multiplication> {};
+    struct addition : seq<multiplication, star<add_op>> {};
 
     // 代入
-    struct assignment : seq<identifier, spaces, one<'='>, spaces, expr> {};
+    struct assignment : seq<assign_id, spaces, one<'='>, spaces, expr> {};
 
     // 式
     struct expr : sor<assignment, addition> {};
@@ -227,6 +172,7 @@ namespace calculator {
     template<typename Rule>
     struct action : nothing<Rule> {};
 
+    // 数値：NumberNode を生成
     template<>
     struct action<number> {
         template<typename ActionInput>
@@ -235,18 +181,25 @@ namespace calculator {
         }
     };
 
+    // 変数参照：VariableNode を生成
     template<>
-    struct action<identifier> {
+    struct action<var> {
         template<typename ActionInput>
         static void apply(const ActionInput& in, ParserState& state) {
-            // 関数呼び出し内部では何もしない
-            if (state.in_function_call) return;
-
-            // 変数として処理
             state.values.push_back(std::make_unique<VariableNode>(in.string()));
         }
     };
 
+    // 代入左辺用 assign_id：何も行わない
+    template<>
+    struct action<assign_id> {
+        template<typename ActionInput>
+        static void apply(const ActionInput& /*in*/, ParserState& state) {
+            // assignment のアクションで入力全体から左辺を抽出するため、ここでは何もしない
+        }
+    };
+
+    // 関数呼び出し：関数名の取得
     template<>
     struct action<func_name> {
         template<typename ActionInput>
@@ -257,6 +210,7 @@ namespace calculator {
         }
     };
 
+    // 関数呼び出し引数：終了処理
     template<>
     struct action<func_args> {
         template<typename ActionInput>
@@ -266,103 +220,88 @@ namespace calculator {
         }
     };
 
+    // 関数呼び出し全体：FunctionNode を生成
     template<>
     struct action<function_call> {
         template<typename ActionInput>
-        static void apply(const ActionInput& in, ParserState& state) {
-            if (state.values.size() < 2) {
+        static void apply(const ActionInput& /*in*/, ParserState& state) {
+            if (state.values.empty()) {
                 throw std::runtime_error("関数呼び出しの構文が不正です");
             }
     
             // 引数は既にスタックの最上部にある
             auto arg = std::move(state.values.back());
             state.values.pop_back();
-    
-            // 関数名のVariableNodeをスタックから取り除く（ここを追加）
-            state.values.pop_back();
-    
             // 関数ノードを作成してスタックに追加
-            state.values.push_back(std::make_unique<FunctionNode>(
-                state.current_function_name, std::move(arg)));
-        }
-    };
-    
-    template<>
-    struct action<one<'('>> {
-        template<typename ActionInput>
-        static void apply(const ActionInput& in, ParserState& state) {
-            // 関数呼び出しの一部でない場合のみ演算子として処理
-            if (!state.in_function_call) {
-                state.operators.push_back('(');
-            }
+            state.values.push_back(std::make_unique<FunctionNode>(state.current_function_name, std::move(arg)));
         }
     };
 
+    // 加減算：演算子取得
     template<>
-    struct action<one<')'>> {
+    struct action<add_operator> {
         template<typename ActionInput>
         static void apply(const ActionInput& in, ParserState& state) {
-            // 関数呼び出しの一部でない場合のみ括弧閉じとして処理
-            if (!state.in_function_call) {
-                state.close_parenthesis();
-            }
+            state.temp_op = in.string()[0];
         }
     };
 
+    // 加減算：左結合で AST を構築
     template<>
-    struct action<plus_minus> {
+    struct action<add_op> {
         template<typename ActionInput>
-        static void apply(const ActionInput& in, ParserState& state) {
-            state.push_operator(in.string()[0]);
+        static void apply(const ActionInput& /*in*/, ParserState& state) {
+            if (state.values.size() < 2)
+                throw std::runtime_error("加算演算子の構文エラー");
+            auto right = std::move(state.values.back());
+            state.values.pop_back();
+            auto left = std::move(state.values.back());
+            state.values.pop_back();
+            state.values.push_back(std::make_unique<BinaryOpNode>(state.temp_op, std::move(left), std::move(right)));
         }
     };
 
+    // 乗除算：演算子取得
     template<>
-    struct action<mult_div> {
+    struct action<mul_operator> {
         template<typename ActionInput>
         static void apply(const ActionInput& in, ParserState& state) {
-            state.push_operator(in.string()[0]);
+            state.temp_op = in.string()[0];
         }
     };
 
+    // 乗除算：左結合で AST を構築
+    template<>
+    struct action<mul_op> {
+        template<typename ActionInput>
+        static void apply(const ActionInput& /*in*/, ParserState& state) {
+            if (state.values.size() < 2)
+                throw std::runtime_error("乗算演算子の構文エラー");
+            auto right = std::move(state.values.back());
+            state.values.pop_back();
+            auto left = std::move(state.values.back());
+            state.values.pop_back();
+            state.values.push_back(std::make_unique<BinaryOpNode>(state.temp_op, std::move(left), std::move(right)));
+        }
+    };
+
+    // 代入：入力全体から左辺を抽出して AssignmentNode を生成
     template<>
     struct action<assignment> {
         template<typename ActionInput>
         static void apply(const ActionInput& in, ParserState& state) {
-            // 代入式の右辺
-            state.apply_remaining_operators();
-            if (state.values.empty()) {
+            if (state.values.empty())
                 throw std::runtime_error("代入式の右辺がありません");
-            }
             auto right = std::move(state.values.back());
             state.values.pop_back();
-    
-            // 左辺の変数ノードをスタックから取り除く（ここを追加）
-            if (state.values.empty()) {
-                throw std::runtime_error("代入式の左辺がありません");
-            }
-            state.values.pop_back();  // 左辺のVariableNodeを削除
-    
-            // 左辺の変数名を抽出（変更なし）
             std::string input = in.string();
             size_t eq_pos = input.find('=');
-            if (eq_pos == std::string::npos) return;
-    
+            if (eq_pos == std::string::npos)
+                throw std::runtime_error("代入式の構文エラー");
             std::string var_name = input.substr(0, eq_pos);
-            // 先頭と末尾の空白を削除
             var_name.erase(0, var_name.find_first_not_of(" \t"));
             var_name.erase(var_name.find_last_not_of(" \t") + 1);
-    
-            // 代入ノードを作成
             state.values.push_back(std::make_unique<AssignmentNode>(var_name, std::move(right)));
-        }
-    };
-    
-    template<>
-    struct action<expr> {
-        template<typename ActionInput>
-        static void apply(const ActionInput& in, ParserState& state) {
-            state.apply_remaining_operators();
         }
     };
 }
