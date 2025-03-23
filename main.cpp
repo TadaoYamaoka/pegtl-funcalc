@@ -137,13 +137,26 @@ public:
                     bool neg_exp = exp < 0;
                     exp = mp::abs(exp);
 
+                    // 底が0の場合の特殊処理
+                    if (lval.numerator() == 0) {
+                        if (exp == 0) {
+                            // 0^0 を1として定義（数学的な慣習に従う）
+                            return Rational(1);
+                        } else if (neg_exp) {
+                            throw std::domain_error("0の負のべき乗は定義されていません");
+                        } else {
+                            // 0^n (n>0) = 0
+                            return Rational(0);
+                        }
+                    }
+
                     // 整数のべき乗を計算
                     if (exp <= std::numeric_limits<unsigned int>::max()) {
                         // boost::multiprecisionの特化版を利用
                         unsigned int uint_exp = static_cast<unsigned int>(exp.convert_to<unsigned int>());
                         if (neg_exp) {
-                            return Rational(1) / Rational(mp::pow(lval.numerator() * rval.denominator(), uint_exp),
-                                                         mp::pow(lval.denominator() * rval.numerator(), uint_exp));
+                            return Rational(1) / Rational(mp::pow(lval.numerator(), uint_exp),
+                                                         mp::pow(lval.denominator(), uint_exp));
                         } else {
                             return Rational(mp::pow(lval.numerator(), uint_exp),
                                            mp::pow(lval.denominator(), uint_exp));
@@ -161,6 +174,16 @@ public:
                         return result;
                     }
                 } else {
+                    // 底が負の場合、指数が有理数だとドメインエラー
+                    if (lval < 0) {
+                        throw std::domain_error("負の底の有理数べき乗は実数の範囲で定義されていません");
+                    }
+
+                    // 底が0で指数が0より小さい場合はドメインエラー
+                    if (lval.numerator() == 0 && rval < 0) {
+                        throw std::domain_error("0の負のべき乗は定義されていません");
+                    }
+
                     // 有理数のべき乗は高精度浮動小数点を使って近似
                     cpp_dec_float lval_f = cpp_dec_float(lval.numerator()) / cpp_dec_float(lval.denominator());
                     cpp_dec_float rval_f = cpp_dec_float(rval.numerator()) / cpp_dec_float(rval.denominator());
@@ -217,13 +240,18 @@ public:
 
         // 数学関数
         if (name_ == "sqrt") {
-            // 有理数の平方根は高精度浮動小数点で計算
+            // 非負のチェック
             cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            if (arg_f < 0)
+                throw std::domain_error("平方根の引数は非負の値である必要があります");
             cpp_dec_float result_f = mp::sqrt(arg_f);
             return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
         }
         else if (name_ == "log") {
+            // 正のチェック
             cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            if (arg_f <= 0)
+                throw std::domain_error("対数関数の引数は正の値である必要があります");
             cpp_dec_float result_f = mp::log(arg_f);
             return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
         }
@@ -237,16 +265,23 @@ public:
             return Rational(mp::abs(arg_val.numerator()), mp::abs(arg_val.denominator()));
         }
         else if (name_ == "log2") {
+            // 正のチェック
             cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            if (arg_f <= 0)
+                throw std::domain_error("log2関数の引数は正の値である必要があります");
             cpp_dec_float result_f = mp::log(arg_f) / mp::log(cpp_dec_float(2));
             return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
         }
         else if (name_ == "log10") {
+            // 正のチェック
             cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            if (arg_f <= 0)
+                throw std::domain_error("log10関数の引数は正の値である必要があります");
             cpp_dec_float result_f = mp::log10(arg_f);
             return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
         }
         else if (name_ == "cbrt") {
+            // cbrtは任意の値で定義されています
             cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
             cpp_dec_float result_f = mp::pow(arg_f, cpp_dec_float(1) / cpp_dec_float(3));
             return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
@@ -262,7 +297,10 @@ public:
             return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
         }
         else if (name_ == "log1p") {
+            // x > -1のチェック
             cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            if (arg_f <= -1)
+                throw std::domain_error("log1p関数の引数は-1より大きい値である必要があります");
             cpp_dec_float result_f = mp::log(cpp_dec_float(1) + arg_f);
             return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
         }
@@ -279,21 +317,31 @@ public:
         }
         else if (name_ == "tan") {
             cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            // tanは (pi/2) + n*pi で定義されていない（無限大）
+            // しかし、浮動小数点での完全なチェックは難しいため、
+            // 実装に任せて、結果が異常に大きい場合は後で確認する
             cpp_dec_float result_f = mp::tan(arg_f);
             return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
         }
         // 逆三角関数
         else if (name_ == "asin") {
             cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            // asinの定義域は[-1, 1]
+            if (arg_f < -1 || arg_f > 1)
+                throw std::domain_error("asin関数の引数は-1から1の範囲内である必要があります");
             cpp_dec_float result_f = mp::asin(arg_f);
             return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
         }
         else if (name_ == "acos") {
             cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
+            // acosの定義域は[-1, 1]
+            if (arg_f < -1 || arg_f > 1)
+                throw std::domain_error("acos関数の引数は-1から1の範囲内である必要があります");
             cpp_dec_float result_f = mp::acos(arg_f);
             return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
         }
         else if (name_ == "atan") {
+            // atanはすべての実数で定義されている
             cpp_dec_float arg_f = cpp_dec_float(arg_val.numerator()) / cpp_dec_float(arg_val.denominator());
             cpp_dec_float result_f = mp::atan(arg_f);
             return Rational(mp::cpp_int(result_f * cpp_dec_float(precision)), precision);
@@ -372,6 +420,25 @@ public:
             if (arg_vals.size() != 2)
                 throw std::runtime_error("pow関数は2つの引数が必要です");
 
+            // 底が0の場合の特殊処理
+            if (arg_vals[0].numerator() == 0) {
+                // 底が0で指数が0の場合は1を返す（数学的慣習）
+                if (arg_vals[1].numerator() == 0 && arg_vals[1].denominator() == 1) {
+                    return Rational(1);
+                }
+                // 底が0で指数が負の場合はドメインエラー
+                if (arg_vals[1] < 0) {
+                    throw std::domain_error("0の負のべき乗は定義されていません");
+                }
+                // 底が0で指数が正の場合は0を返す
+                return Rational(0);
+            }
+
+            // 底が負で指数が有理数の場合はドメインエラー
+            if (arg_vals[0] < 0 && arg_vals[1].denominator() != 1) {
+                throw std::domain_error("負の底の有理数べき乗は実数の範囲で定義されていません");
+            }
+
             // pow関数は整数のべき乗の場合、専用の実装を使用
             if (arg_vals[1].denominator() == 1) {
                 mp::cpp_int exp = arg_vals[1].numerator();
@@ -442,6 +509,11 @@ public:
 
             cpp_dec_float y = cpp_dec_float(arg_vals[0].numerator()) / cpp_dec_float(arg_vals[0].denominator());
             cpp_dec_float x = cpp_dec_float(arg_vals[1].numerator()) / cpp_dec_float(arg_vals[1].denominator());
+
+            // atan2(0,0)は数学的に未定義
+            if (y == 0 && x == 0)
+                throw std::domain_error("atan2(0,0)は定義されていません");
+
             cpp_dec_float result = mp::atan2(y, x);
 
             return Rational(mp::cpp_int(result * cpp_dec_float(precision)), precision);
@@ -452,7 +524,7 @@ public:
             if (arg_vals.size() != 2)
                 throw std::runtime_error("ldexp関数は2つの引数が必要です");
             if (arg_vals[1].denominator() != 1)
-                throw std::runtime_error("ldexpの第2引数は整数である必要があります");
+                throw std::domain_error("ldexpの第2引数は整数である必要があります");
 
             int exp = static_cast<int>(arg_vals[1].numerator().convert_to<int>());
             cpp_dec_float x = cpp_dec_float(arg_vals[0].numerator()) / cpp_dec_float(arg_vals[0].denominator());
@@ -991,6 +1063,8 @@ int main() {
             }
         } catch (const pegtl::parse_error& e) {
             std::cerr << "構文エラー: " << e.what() << std::endl;
+        } catch (const std::domain_error& e) {
+            std::cerr << "定義域エラー: " << e.what() << std::endl;
         } catch (const std::exception& e) {
             std::cerr << "エラー: " << e.what() << std::endl;
         }
